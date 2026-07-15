@@ -1,7 +1,13 @@
 package com.chatclient;
 
-import java.io.*;
-import java.net.*;
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
+import java.nio.channels.SocketChannel;
+import java.nio.charset.StandardCharsets;
+import java.util.Iterator;
 
 public class ChatConnection {
 
@@ -16,9 +22,8 @@ public class ChatConnection {
     private final int port;
     private final ChatConnectionListener listener;
 
-    private Socket socket;
-    private BufferedReader input;
-    private PrintWriter output;
+    private SocketChannel socketChannel;
+    private Selector selector;
     private Thread receiveThread;
     private volatile boolean isRunning = false;
 
@@ -34,12 +39,15 @@ public class ChatConnection {
         }
 
         try {
-            socket = new Socket(host, port);
-            input = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-            output = new PrintWriter(socket.getOutputStream(), true);
+            socketChannel = SocketChannel.open();
+            socketChannel.connect(new InetSocketAddress(host, port));
+            socketChannel.configureBlocking(false);
+            
+            selector = Selector.open();
+            socketChannel.register(selector, SelectionKey.OP_READ);
             
             isRunning = true;
-            receiveThread = new Thread(this::receiveLoop, "ChatConnection-ReceiveThread");
+            receiveThread = new Thread(this::receiveLoop, "ChatConnection-NIO-ReceiveThread");
             receiveThread.start();
 
             if (listener != null) {
@@ -55,10 +63,14 @@ public class ChatConnection {
         if (!isConnected()) {
             throw new IllegalStateException("Not connected to the server.");
         }
-        if (output != null) {
-            output.println(message);
-            if (output.checkError()) {
-                throw new IOException("Failed to send message.");
+        if (socketChannel != null) {
+            String payload = message + "\n";
+            ByteBuffer buffer = ByteBuffer.wrap(payload.getBytes(StandardCharsets.UTF_8));
+            while (buffer.hasRemaining()) {
+                int written = socketChannel.write(buffer);
+                if (written == 0) {
+                    Thread.sleep(10);
+                }
             }
         }
     }
@@ -68,6 +80,9 @@ public class ChatConnection {
             return;
         }
         isRunning = false;
+        if (selector != null) {
+            selector.wakeup();
+        }
         cleanup();
         if (listener != null) {
             listener.onDisconnected();
@@ -75,15 +90,54 @@ public class ChatConnection {
     }
 
     public synchronized boolean isConnected() {
-        return socket != null && !socket.isClosed();
+        return socketChannel != null && socketChannel.isOpen() && socketChannel.isConnected();
     }
 
     private void receiveLoop() {
+        ByteBuffer buffer = ByteBuffer.allocate(2048);
+        StringBuilder accumulator = new StringBuilder();
+
         try {
-            String message;
-            while (isRunning && (message = input.readLine()) != null) {
-                if (listener != null) {
-                    listener.onMessageReceived(message);
+            while (isRunning) {
+                int selected = selector.select(1000);
+                if (!isRunning) {
+                    break;
+                }
+                if (selected == 0) {
+                    continue;
+                }
+
+                Iterator<SelectionKey> it = selector.selectedKeys().iterator();
+                while (it.hasNext()) {
+                    SelectionKey key = it.next();
+                    it.remove();
+
+                    if (key.isReadable()) {
+                        buffer.clear();
+                        int bytesRead = socketChannel.read(buffer);
+                        if (bytesRead == -1) {
+                            disconnect();
+                            return;
+                        }
+
+                        buffer.flip();
+                        byte[] bytes = new byte[buffer.remaining()];
+                        buffer.get(bytes);
+                        accumulator.append(new String(bytes, StandardCharsets.UTF_8));
+
+                        int newlineIdx;
+                        while ((newlineIdx = accumulator.indexOf("\n")) != -1) {
+                            String line = accumulator.substring(0, newlineIdx);
+                            if (line.endsWith("\r")) {
+                                line = line.substring(0, line.length() - 1);
+                            }
+                            accumulator.delete(0, newlineIdx + 1);
+
+                            if (listener != null) {
+                                listener.onMessageReceived(line);
+                            }
+                        }
+                    }
                 }
             }
         } catch (Exception e) {
@@ -103,37 +157,28 @@ public class ChatConnection {
 
     private synchronized void cleanup() {
         isRunning = false;
-        
-        if (input != null) {
+
+        if (selector != null) {
             try {
-                input.close();
-            } catch (Exception e) {
+                selector.close();
+            } catch (IOException e) {
                 // Ignore
             } finally {
-                input = null;
+                selector = null;
             }
         }
-        if (output != null) {
+        if (socketChannel != null) {
             try {
-                output.close();
-            } catch (Exception e) {
-                // Ignore
-            } finally {
-                output = null;
-            }
-        }
-        if (socket != null) {
-            try {
-                if (!socket.isClosed()) {
-                    socket.close();
+                if (socketChannel.isOpen()) {
+                    socketChannel.close();
                 }
-            } catch (Exception e) {
+            } catch (IOException e) {
                 // Ignore
             } finally {
-                socket = null;
+                socketChannel = null;
             }
         }
-        
+
         if (receiveThread != null && receiveThread != Thread.currentThread()) {
             receiveThread.interrupt();
             receiveThread = null;

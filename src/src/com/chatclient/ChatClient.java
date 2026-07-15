@@ -23,32 +23,24 @@ public class ChatClient extends JFrame {
                 new ChatConnection.ChatConnectionListener() {
                     @Override
                     public void onConnected() {
-                        SwingUtilities.invokeLater(() -> {
-                            statusLabel.setText("Connected");
-                            chatArea.append("Connected to server\n");
-                        });
+                        updateStatus("Connected");
+                        updateChatArea("Connected to server");
                     }
 
                     @Override
                     public void onDisconnected() {
-                        SwingUtilities.invokeLater(() -> {
-                            statusLabel.setText("Disconnected");
-                            chatArea.append("Disconnected\n");
-                        });
+                        updateStatus("Disconnected");
+                        updateChatArea("Disconnected");
                     }
 
                     @Override
                     public void onMessageReceived(String message) {
-                        SwingUtilities.invokeLater(() -> {
-                            chatArea.append(message + "\n");
-                        });
+                        updateChatArea(message);
                     }
 
                     @Override
                     public void onError(String title, String message) {
-                        SwingUtilities.invokeLater(() -> {
-                            JOptionPane.showMessageDialog(ChatClient.this, message, title, JOptionPane.ERROR_MESSAGE);
-                        });
+                        runOnEDT(() -> JOptionPane.showMessageDialog(ChatClient.this, message, title, JOptionPane.ERROR_MESSAGE));
                     }
                 }
         );
@@ -100,6 +92,22 @@ public class ChatClient extends JFrame {
         setVisible(true);
     }
 
+    private void runOnEDT(Runnable runnable) {
+        if (SwingUtilities.isEventDispatchThread()) {
+            runnable.run();
+        } else {
+            SwingUtilities.invokeLater(runnable);
+        }
+    }
+
+    private void updateChatArea(String text) {
+        runOnEDT(() -> chatArea.append(text + "\n"));
+    }
+
+    private void updateStatus(String status) {
+        runOnEDT(() -> statusLabel.setText(status));
+    }
+
     private void connect() {
         try {
             connection.connect();
@@ -116,7 +124,7 @@ public class ChatClient extends JFrame {
             }
 
             connection.sendMessage(message);
-            chatArea.append("You: " + message + "\n");
+            updateChatArea("You: " + message);
             messageField.setText("");
         } catch (Exception e) {
             JOptionPane.showMessageDialog(this, "Message sending failed");
